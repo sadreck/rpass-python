@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+from src.config import Config
+from src.logging import Logging
+from src.commandline import CommandLine
+from src.password_storage import PasswordStorage
+from src.http_client import HttpClient
+from src.password_validator import PasswordValidator
+from src.pgp import PGP
+from version import __VERSION__
+
+# Remove the first element, that's the script name.
+sys.argv.pop(0)
+if len(sys.argv) == 0:
+    Logging.error("No arguments specified. Run help to see available options")
+    exit(1)
+
+script_path = os.path.dirname(os.path.realpath(__file__))
+
+config_file = os.path.join(script_path, 'rpass.config')
+default_password_storage = os.path.join(script_path, 'rpass.storage')
+try:
+    config = Config(config_file)
+    arguments = CommandLine(sys.argv)
+    Logging.is_verbose = arguments.verbose
+    password_storage = PasswordStorage(config.get('storage', default_password_storage))
+    http_client = HttpClient(
+        config.get('hostname', 'www.remotepassword.com'),
+        config.get('port', 443),
+        config.get('https', True),
+        config.get('method', 'post'),
+        config.get('verifySSL', True)
+    )
+    password_validator = PasswordValidator()
+    pgp = PGP(config.get('gpgPath', '/usr/bin/gpg'))
+except Exception as e:
+    Logging.error(str(e))
+    exit(1)
+
+if arguments.action == 'add':
+    password_storage.add(
+        arguments.name,
+        arguments.token1,
+        arguments.token2,
+        arguments.checksum,
+        arguments.key
+    )
+    Logging.info("Password {0} added successfully".format(arguments.name))
+elif arguments.action == 'clear':
+    password_storage.clear()
+    Logging.info("All passwords have been removed from local storage")
+elif arguments.action == 'config':
+    if arguments.list:
+        settings = config.all()
+        data = [['Name', 'Value']]
+        for name, value in settings.items():
+            data.append([name, value])
+        Logging.table(data)
+    elif arguments.value is None:
+        # Getter
+        Logging.info(config.get(arguments.name))
+    else:
+        # Setter
+        try:
+            config.set(arguments.name, arguments.value)
+            Logging.info("OK")
+        except Exception as e:
+            Logging.error(str(e))
+            exit(1)
+elif arguments.action == 'delete':
+    password_storage.delete(arguments.name)
+    Logging.info("Password {0} deleted successfully".format(arguments.name))
+elif arguments.action == 'get':
+    password = password_storage.get_by_name(arguments.name)
+    if not password:
+        # Don't display anything, just exit.
+        Logging.verbose("Could not find password: {0}".format(arguments.name))
+        exit(1)
+    data = http_client.fetch(password['token1'], password['token2'], arguments.format)
+    output = password_validator.validate(password, data, arguments.format)
+    if not output:
+        Logging.verbose("Password data validation failed")
+        exit(1)
+    output = pgp.decrypt(output, password['key'])
+    if output is None:
+        Logging.verbose("Could not decrypt data using key: {0}".format(password['key']))
+        exit(1)
+    Logging.info(output, False)
+elif arguments.action == 'list':
+    passwords = password_storage.all()
+    data = []
+    i = 0
+    for name, password in passwords.items():
+        if len(data) == 0:
+            data.append(['#'] + list(password.keys()))
+        i += 1
+        data.append([i] + list(password.values()))
+    Logging.table(data)
+elif arguments.action == 'view':
+    password = password_storage.get_by_name(arguments.name)
+    if not password:
+        Logging.info('Password {0} not found'.format(arguments.name))
+    else:
+        Logging.table(
+            [
+                list(password.keys()),
+                list(password.values())
+            ]
+        )
+elif arguments.action == 'help':
+    help_file = os.path.join(script_path, 'help.txt')
+    with open(help_file, 'r') as f:
+        contents = f.read()
+    contents = contents.replace('%VERSION%', __VERSION__)
+    Logging.info(contents)
+elif arguments.action == 'version':
+    Logging.info(__VERSION__)
+exit(0)
